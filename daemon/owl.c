@@ -197,6 +197,8 @@ int main(int argc, char *argv[]) {
 
 	if (state.io.wlan_ifindex)
 		log_info("WLAN device: %s (addr %s)", state.io.wlan_ifname, ether_ntoa(&state.io.if_ether_addr));
+	if (state.io.mon_ifindex)
+		log_info("Monitor device: %s", state.io.mon_ifname);
 	if (state.io.host_ifindex)
 		log_info("Host device: %s", state.io.host_ifname);
 

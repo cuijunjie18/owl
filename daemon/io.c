@@ -273,9 +273,12 @@ static int io_state_init_wlan_try_savefile(struct io_state *state) {
 
 static int io_state_init_wlan(struct io_state *state, const char *wlan, const struct ether_addr *bssid_filter) {
 	int err;
+	const char *pcap_dev; /* device name to open with pcap */
 
 	strcpy(state->wlan_ifname, wlan);
 	state->wlan_is_file = 0;
+	state->mon_ifindex = 0;
+	state->mon_ifname[0] = '\0';
 
 	if (!io_state_init_wlan_try_savefile(state)) {
 		log_info("Using savefile instead of device");
@@ -287,33 +290,73 @@ static int io_state_init_wlan(struct io_state *state, const char *wlan, const st
 		log_error("No such interface exists %s", state->wlan_ifname);
 		return -ENOENT;
 	}
-	/* TODO we might instead open a new monitor interface instead */
-	err = link_down(state->wlan_ifindex);
+
+	/* Get the MAC address before potentially changing the interface mode */
+	err = link_ether_addr_get(state->wlan_ifname, &state->if_ether_addr);
 	if (err < 0) {
-		log_error("Could not set link down: %s", state->wlan_ifname);
+		log_error("Could not get LLC address from %s", state->wlan_ifname);
 		return err;
 	}
+
 	if (!state->wlan_no_monitor_mode) {
+#ifndef __APPLE__
+		/* On Linux, try to create a separate monitor interface first.
+		 * This avoids disrupting the main WiFi connection and works
+		 * better with newer kernels where changing the main interface
+		 * to monitor mode may fail or cause issues. */
+		strcpy(state->mon_ifname, "owl_mon0");
+		err = create_monitor_interface(state->wlan_ifindex, state->mon_ifname, &state->mon_ifindex);
+		if (err == 0) {
+			log_info("Using separate monitor interface %s", state->mon_ifname);
+			/* Bring up the monitor interface */
+			err = link_up(state->mon_ifindex);
+			if (err < 0) {
+				log_error("Could not set monitor interface up: %s", state->mon_ifname);
+				delete_monitor_interface(state->mon_ifindex);
+				state->mon_ifindex = 0;
+				return err;
+			}
+			pcap_dev = state->mon_ifname;
+		} else {
+			/* Fallback: set the main interface to monitor mode */
+			log_warn("Could not create separate monitor interface, falling back to changing main interface");
+			state->mon_ifindex = 0;
+			state->mon_ifname[0] = '\0';
+
+			err = link_down(state->wlan_ifindex);
+			if (err < 0) {
+				log_error("Could not set link down: %s", state->wlan_ifname);
+				return err;
+			}
+			err = set_monitor_mode(state->wlan_ifindex);
+			if (err < 0) {
+				log_error("Could not put device in monitor mode: %s", state->wlan_ifname);
+				return err;
+			}
+			err = link_up(state->wlan_ifindex);
+			if (err < 0) {
+				log_error("Could not set link up: %s", state->wlan_ifname);
+				return err;
+			}
+			pcap_dev = state->wlan_ifname;
+		}
+#else
+		/* On macOS, monitor mode is handled by libpcap */
 		err = set_monitor_mode(state->wlan_ifindex);
 		if (err < 0) {
 			log_error("Could not put device in monitor mode: %s", state->wlan_ifname);
 			return err;
 		}
+		pcap_dev = state->wlan_ifname;
+#endif
+	} else {
+		pcap_dev = state->wlan_ifname;
 	}
-	err = link_up(state->wlan_ifindex);
-	if (err < 0) {
-		log_error("Could not set link up: %s", state->wlan_ifname);
-		return err;
-	}
-	state->wlan_fd = open_nonblocking_device(state->wlan_ifname, &state->wlan_handle, bssid_filter);
+
+	state->wlan_fd = open_nonblocking_device(pcap_dev, &state->wlan_handle, bssid_filter);
 	if (state->wlan_fd < 0) {
-		log_error("Could not open device: %s", state->wlan_ifname);
-		return err;
-	}
-	err = link_ether_addr_get(state->wlan_ifname, &state->if_ether_addr);
-	if (err < 0) {
-		log_error("Could not get LLC address from %s", state->wlan_ifname);
-		return err;
+		log_error("Could not open device: %s", pcap_dev);
+		return -1;
 	}
 
 	return 0;
@@ -357,6 +400,14 @@ int io_state_init(struct io_state *state, const char *wlan, const char *host, co
 void io_state_free(struct io_state *state) {
 	close(state->host_fd);
 	pcap_close(state->wlan_handle);
+#ifndef __APPLE__
+	/* Clean up the separate monitor interface if we created one */
+	if (state->mon_ifindex > 0) {
+		link_down(state->mon_ifindex);
+		delete_monitor_interface(state->mon_ifindex);
+		state->mon_ifindex = 0;
+	}
+#endif
 }
 
 int wlan_send(const struct io_state *state, const uint8_t *buf, int len) {

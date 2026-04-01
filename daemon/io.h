@@ -35,6 +35,8 @@ struct io_state {
 	pcap_t *wlan_handle;
 	char wlan_ifname[PATH_MAX]; /* name of WLAN iface */
 	int wlan_ifindex;     /* index of WLAN iface */
+	char mon_ifname[IFNAMSIZ];  /* name of monitor iface (if separate) */
+	int mon_ifindex;      /* index of monitor iface (0 if not used) */
 	char host_ifname[IFNAMSIZ]; /* name of host iface */
 	int host_ifindex;     /* index of host iface */
 	struct ether_addr if_ether_addr; /* MAC address of WLAN and host iface */

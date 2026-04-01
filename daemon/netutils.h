@@ -44,6 +44,22 @@ void netutils_cleanup();
 
 int set_monitor_mode(int ifindex);
 
+/**
+ * Create a new monitor interface on the same phy as the given interface.
+ * @param ifindex  index of the base interface
+ * @param mon_name name for the new monitor interface (e.g. "mon0")
+ * @param mon_ifindex output: index of the newly created interface
+ * @return 0 on success, a negative value on failure
+ */
+int create_monitor_interface(int ifindex, const char *mon_name, int *mon_ifindex);
+
+/**
+ * Delete a previously created monitor interface.
+ * @param mon_ifindex index of the monitor interface to delete
+ * @return 0 on success, a negative value on failure
+ */
+int delete_monitor_interface(int mon_ifindex);
+
 int is_channel_available(int ifindex, int channel, bool *is_available);
 
 int set_channel(int ifindex, int channel);

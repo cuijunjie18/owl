@@ -272,6 +272,146 @@ int set_monitor_mode(int ifindex) {
 	return err;
 }
 
+/**
+ * Get the wiphy index for a given interface index.
+ */
+static int get_wiphy_index(int ifindex) {
+	int err;
+	struct rtnl_link *link;
+
+	err = rtnl_link_get_kernel(nlroute_state.socket, ifindex, NULL, &link);
+	if (err < 0) {
+		log_error("Could not get link for wiphy lookup: %s", nl_geterror(err));
+		return -1;
+	}
+
+	/* We need to use nl80211 to get the wiphy index */
+	rtnl_link_put(link);
+	return -1; /* will be resolved via NL80211_ATTR_IFINDEX instead */
+}
+
+int create_monitor_interface(int ifindex, const char *mon_name, int *mon_ifindex) {
+	int err = 0;
+	struct nl_msg *m = NULL;
+	struct nl_msg *flags = NULL;
+
+	m = nlmsg_alloc();
+	if (!m) {
+		log_error("Could not allocate netlink message");
+		err = -ENOMEM;
+		goto out;
+	}
+
+	genlmsg_put(m, 0, 0, nl80211_state.nl80211_id, 0, 0, NL80211_CMD_NEW_INTERFACE, 0);
+
+	NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, ifindex);
+	NLA_PUT_STRING(m, NL80211_ATTR_IFNAME, mon_name);
+	NLA_PUT_U32(m, NL80211_ATTR_IFTYPE, NL80211_IFTYPE_MONITOR);
+
+	/* Try to set active monitor flag for frame injection support */
+	flags = nlmsg_alloc();
+	if (flags) {
+		NLA_PUT_FLAG(flags, NL80211_MNTR_FLAG_ACTIVE);
+		nla_put_nested(m, NL80211_ATTR_MNTR_FLAGS, flags);
+		nlmsg_free(flags);
+		flags = NULL;
+	}
+
+	err = nl_send_auto(nl80211_state.socket, m);
+	if (err < 0) {
+		log_error("Error while sending via netlink: %s", nl_geterror(err));
+		goto out;
+	}
+
+	err = nl_recvmsgs_default(nl80211_state.socket);
+	if (err < 0) {
+		/* Retry without active monitor flag */
+		log_warn("Could not create active monitor interface, retrying without active flag");
+		nlmsg_free(m);
+		m = nlmsg_alloc();
+		if (!m) {
+			err = -ENOMEM;
+			goto out;
+		}
+
+		genlmsg_put(m, 0, 0, nl80211_state.nl80211_id, 0, 0, NL80211_CMD_NEW_INTERFACE, 0);
+		NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, ifindex);
+		NLA_PUT_STRING(m, NL80211_ATTR_IFNAME, mon_name);
+		NLA_PUT_U32(m, NL80211_ATTR_IFTYPE, NL80211_IFTYPE_MONITOR);
+
+		err = nl_send_auto(nl80211_state.socket, m);
+		if (err < 0) {
+			log_error("Error while sending via netlink: %s", nl_geterror(err));
+			goto out;
+		}
+
+		err = nl_recvmsgs_default(nl80211_state.socket);
+		if (err < 0) {
+			log_error("Could not create monitor interface: %s", nl_geterror(err));
+			goto out;
+		}
+	}
+
+	/* Get the ifindex of the newly created interface */
+	*mon_ifindex = if_nametoindex(mon_name);
+	if (!*mon_ifindex) {
+		log_error("Created monitor interface %s but could not get its index", mon_name);
+		err = -ENOENT;
+		goto out;
+	}
+
+	log_info("Created monitor interface %s (ifindex %d)", mon_name, *mon_ifindex);
+	goto out;
+
+nla_put_failure:
+	log_error("building message failed");
+	err = -ENOBUFS;
+out:
+	if (m)
+		nlmsg_free(m);
+	if (flags)
+		nlmsg_free(flags);
+	return err;
+}
+
+int delete_monitor_interface(int mon_ifindex) {
+	int err = 0;
+	struct nl_msg *m = NULL;
+
+	m = nlmsg_alloc();
+	if (!m) {
+		log_error("Could not allocate netlink message");
+		err = -ENOMEM;
+		goto out;
+	}
+
+	genlmsg_put(m, 0, 0, nl80211_state.nl80211_id, 0, 0, NL80211_CMD_DEL_INTERFACE, 0);
+	NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, mon_ifindex);
+
+	err = nl_send_auto(nl80211_state.socket, m);
+	if (err < 0) {
+		log_error("Error while sending via netlink: %s", nl_geterror(err));
+		goto out;
+	}
+
+	err = nl_recvmsgs_default(nl80211_state.socket);
+	if (err < 0) {
+		log_error("Could not delete monitor interface: %s", nl_geterror(err));
+		goto out;
+	}
+
+	log_info("Deleted monitor interface (ifindex %d)", mon_ifindex);
+	goto out;
+
+nla_put_failure:
+	log_error("building message failed");
+	err = -ENOBUFS;
+out:
+	if (m)
+		nlmsg_free(m);
+	return err;
+}
+
 #define BIT(x) (1ULL<<(x))
 
 struct channels_ctx {
@@ -408,33 +548,29 @@ out:
 	return err;
 }
 
-int set_channel(int ifindex, int channel) {
+static int _set_channel(int ifindex, int freq, int use_ht40) {
 	int err;
 	struct nl_msg *m;
-	int freq;
-
-	freq = ieee80211_channel_to_frequency(channel);
-	if (!freq) {
-		log_error("Invalid channel number %d", channel);
-		err = -EINVAL;
-		goto out;
-	}
 
 	m = nlmsg_alloc();
 	if (!m) {
 		log_error("Could not allocate netlink message");
-		err = -ENOMEM;
-		goto out;
+		return -ENOMEM;
 	}
 
-	if (genlmsg_put(m, 0, 0, nl80211_state.nl80211_id, 0, 0, NL80211_CMD_SET_CHANNEL, 0) == NULL) {
+	/* Use NL80211_CMD_SET_WIPHY which is the modern way to set frequency.
+	 * NL80211_CMD_SET_CHANNEL is deprecated in newer kernels. */
+	if (genlmsg_put(m, 0, 0, nl80211_state.nl80211_id, 0, 0, NL80211_CMD_SET_WIPHY, 0) == NULL) {
 		err = -ENOBUFS;
 		goto out;
 	}
 
 	NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, ifindex);
 	NLA_PUT_U32(m, NL80211_ATTR_WIPHY_FREQ, freq);
-	NLA_PUT_U32(m, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_HT40PLUS);
+	if (use_ht40)
+		NLA_PUT_U32(m, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_HT40PLUS);
+	else
+		NLA_PUT_U32(m, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
 
 	err = nl_send_auto(nl80211_state.socket, m);
 	if (err < 0) {
@@ -451,6 +587,30 @@ nla_put_failure:
 out:
 	if (m)
 		nlmsg_free(m);
+	return err;
+}
+
+int set_channel(int ifindex, int channel) {
+	int err;
+	int freq;
+
+	freq = ieee80211_channel_to_frequency(channel);
+	if (!freq) {
+		log_error("Invalid channel number %d", channel);
+		return -EINVAL;
+	}
+
+	/* First try HT40+ */
+	err = _set_channel(ifindex, freq, 1);
+	if (err == 0)
+		return 0;
+
+	/* Fallback to no-HT if HT40+ is not supported */
+	log_warn("Could not set channel %d with HT40+, falling back to no-HT", channel);
+	err = _set_channel(ifindex, freq, 0);
+	if (err < 0) {
+		log_error("Could not set channel %d: %s", channel, nl_geterror(err));
+	}
 	return err;
 }
 
@@ -537,6 +697,18 @@ int set_monitor_mode(int ifindex) {
 	corewlan_disassociate(ifindex);
 	/* TODO implement here instead of using libpcap */
 	return 0;
+}
+
+int create_monitor_interface(int ifindex, const char *mon_name, int *mon_ifindex) {
+	(void) ifindex;
+	(void) mon_name;
+	(void) mon_ifindex;
+	return -1; /* not supported on macOS, monitor mode is handled by libpcap */
+}
+
+int delete_monitor_interface(int mon_ifindex) {
+	(void) mon_ifindex;
+	return -1; /* not supported on macOS */
 }
 
 int is_channel_available(int ifindex, int channel, bool *is_available) {
