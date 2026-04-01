@@ -12,8 +12,3 @@ target_compile_definitions(radiotap PRIVATE -D_BSD_SOURCE -D_DEFAULT_SOURCE -DRA
 add_subdirectory(src)
 
 add_subdirectory(daemon)
-
-option(INSTALL_GTEST "" OFF)
-add_subdirectory(googletest)
-
-add_subdirectory(tests)
