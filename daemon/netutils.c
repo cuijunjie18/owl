@@ -199,7 +199,7 @@ out:
 	return err;
 }
 
-int set_monitor_mode(int ifindex) {
+static int _set_monitor_mode(int ifindex, int use_active_flag) {
 	int err = 0;
 	struct nl_msg *m = NULL;
 	struct nl_msg *flags = NULL;
@@ -216,16 +216,18 @@ int set_monitor_mode(int ifindex) {
 	NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, ifindex);
 	NLA_PUT_U32(m, NL80211_ATTR_IFTYPE, NL80211_IFTYPE_MONITOR);
 
-	flags = nlmsg_alloc();
-	if (!flags) {
-		log_error("Could not allocate netlink message");
-		err = -ENOMEM;
-		goto out;
+	if (use_active_flag) {
+		flags = nlmsg_alloc();
+		if (!flags) {
+			log_error("Could not allocate netlink message");
+			err = -ENOMEM;
+			goto out;
+		}
+		NLA_PUT_FLAG(flags, NL80211_MNTR_FLAG_ACTIVE);
+		nla_put_nested(m, NL80211_ATTR_MNTR_FLAGS, flags);
+		nlmsg_free(flags);
+		flags = 0;
 	}
-	NLA_PUT_FLAG(flags, NL80211_MNTR_FLAG_ACTIVE);
-	nla_put_nested(m, NL80211_ATTR_MNTR_FLAGS, flags);
-	nlmsg_free(flags);
-	flags = 0;
 
 	err = nl_send_auto(nl80211_state.socket, m);
 	if (err < 0) {
@@ -249,6 +251,24 @@ out:
 		nlmsg_free(m);
 	if (flags)
 		nlmsg_free(flags);
+	return err;
+}
+
+int set_monitor_mode(int ifindex) {
+	int err;
+	/* First try active monitor mode (required for frame injection in AWDL) */
+	err = _set_monitor_mode(ifindex, 1);
+	if (err == 0) {
+		log_info("Set active monitor mode successfully");
+		return 0;
+	}
+	/* Fallback: some drivers (e.g. iwlwifi on newer kernels) do not support
+	 * active monitor mode. Try plain monitor mode instead. */
+	log_warn("Active monitor mode not supported, falling back to plain monitor mode");
+	err = _set_monitor_mode(ifindex, 0);
+	if (err == 0) {
+		log_info("Set plain monitor mode successfully");
+	}
 	return err;
 }
 
@@ -449,13 +469,17 @@ static int link_updown(int ifindex, int up) {
 	if (up)
 		rtnl_link_set_flags(req, rtnl_link_str2flags("up"));
 	else
-		rtnl_link_set_flags(req, rtnl_link_str2flags("down"));
+		rtnl_link_unset_flags(req, rtnl_link_str2flags("up"));
 
-	rtnl_link_change(nlroute_state.socket, old, req, 0);
+	err = rtnl_link_change(nlroute_state.socket, old, req, 0);
+	if (err < 0) {
+		log_error("Could not change link state: %s", nl_geterror(err));
+	}
 
+	rtnl_link_put(req);
 	rtnl_link_put(old);
 
-	return 0;
+	return err;
 }
 
 int link_up(int ifindex) {

@@ -290,18 +290,19 @@ static int io_state_init_wlan(struct io_state *state, const char *wlan, const st
 	/* TODO we might instead open a new monitor interface instead */
 	err = link_down(state->wlan_ifindex);
 	if (err < 0) {
-		log_error("Could not set link down: %", state->wlan_ifname);
+		log_error("Could not set link down: %s", state->wlan_ifname);
 		return err;
 	}
-	if (!state->wlan_no_monitor_mode) /* if device is already in monitor mode */
+	if (!state->wlan_no_monitor_mode) {
 		err = set_monitor_mode(state->wlan_ifindex);
-	if (err < 0) {
-		log_error("Could not put device in monitor mode: %s", state->wlan_ifname);
-		return err;
+		if (err < 0) {
+			log_error("Could not put device in monitor mode: %s", state->wlan_ifname);
+			return err;
+		}
 	}
 	err = link_up(state->wlan_ifindex);
 	if (err < 0) {
-		log_error("Could set link up: %", state->wlan_ifname);
+		log_error("Could not set link up: %s", state->wlan_ifname);
 		return err;
 	}
 	state->wlan_fd = open_nonblocking_device(state->wlan_ifname, &state->wlan_handle, bssid_filter);
